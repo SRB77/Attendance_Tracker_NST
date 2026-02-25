@@ -20,6 +20,6 @@
     "service_worker": "background.js",
     "type": "module"
   },
-  "permissions": ["storage", "scripting", "activeTab", "cookies"],
+  "permissions": ["storage", "cookies", "tabs"],
   "host_permissions": ["*://*.newtonschool.co/*"]
 }

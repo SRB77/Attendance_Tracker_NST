@@ -1,209 +1,324 @@
-import React, { useState, useEffect } from "react";
-import axios from "axios";
+import React, { useState, useEffect, useCallback } from "react";
 import AttendanceDashboard from "./components/AttendanceDashboard";
+import {
+  RefreshCw,
+  AlertTriangle,
+  LogIn,
+  WifiOff,
+  BookOpen,
+} from "lucide-react";
 
 function App() {
   const [attendanceData, setAttendanceData] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null); // "NOT_LOGGED_IN" | "FETCH_FAILED_NO_CACHE" | "NO_NST_COURSE" | null
+  const [isStale, setIsStale] = useState(false);
+  const [staleReason, setStaleReason] = useState("");
+  const [lastFetched, setLastFetched] = useState(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  // Get the access token from Newton School cookies
-  const getAccessToken = async () => {
-    const response = await chrome.runtime.sendMessage({
-      action: "getCookies",
-    });
-    return response.cookies.find(
-      (cookie) => cookie.name === "access_token_ns_student_web",
-    ).value;
-  };
-
-  // Fetch attendance data for grouped courses
-  const fetchAttendanceData = async (groupedCourses) => {
-    const token = await getAccessToken();
-    const results = [];
-    let id = 0;
-
-    const colorPalette = [
-      "bg-blue-500",
-      "bg-green-500",
-      "bg-purple-500",
-      "bg-red-500",
-      "bg-yellow-500",
-      "bg-pink-500",
-      "bg-orange-500",
-      "bg-teal-500",
-      "bg-indigo-500",
-      "bg-cyan-500",
-    ];
-    const usedColors = [];
-
-    for (const subjectName in groupedCourses) {
-      const group = groupedCourses[subjectName];
-      let mainAttended = 0,
-        mainTotal = 0,
-        labAttended = 0,
-        labTotal = 0;
-
-      // Fetch main course attendance
-      for (const course of group.main) {
-        try {
-          const { data } = await axios.get(
-            `https://my.newtonschool.co/api/v2/course/h/${course.hash}/self_performance`,
-            { headers: { Authorization: `Bearer ${token}` } },
-          );
-          mainAttended += data.total_lectures_attended || 0;
-          mainTotal += data.total_lectures || 0;
-        } catch (err) {
-          console.error(
-            `Error fetching main course data for ${course.short_display_name}:`,
-            err,
-          );
-        }
-      }
-
-      // Fetch lab/tut course attendance
-      for (const course of group.lab) {
-        try {
-          const { data } = await axios.get(
-            `https://my.newtonschool.co/api/v2/course/h/${course.hash}/self_performance`,
-            { headers: { Authorization: `Bearer ${token}` } },
-          );
-          labAttended += data.total_lectures_attended || 0;
-          labTotal += data.total_lectures || 0;
-        } catch (err) {
-          console.error(
-            `Error fetching lab course data for ${course.short_display_name}:`,
-            err,
-          );
-        }
-      }
-
-      // Pick a unique random color
-      let color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
-      while (usedColors.includes(color)) {
-        color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
-      }
-      usedColors.push(color);
-
-      const totalAttended = mainAttended + labAttended;
-      const totalClasses = mainTotal + labTotal;
-
-      results.push({
-        id: id,
-        name: subjectName,
-        total: totalClasses,
-        attended: totalAttended,
-        futureClasses: Math.abs(totalClasses - 53),
-        color: color,
-        mainAttended: mainAttended,
-        mainTotal: mainTotal,
-        labAttended: labAttended,
-        labTotal: labTotal,
-      });
-      id++;
+  // ── Fetch attendance via background service worker ──
+  const fetchAttendance = useCallback((isManualRefresh = false) => {
+    if (isManualRefresh) {
+      setIsRefreshing(true);
+    } else {
+      setIsLoading(true);
     }
 
-    setAttendanceData(results);
-    setIsLoading(false);
-  };
+    setError(null);
 
-  // Group courses by subject prefix (e.g., "CS101")
-  const groupCourses = async (courses) => {
-    // Filter to only Newton School of Technology courses
-    courses = courses.filter((c) =>
-      c.title.includes("Newton School of Technology"),
-    );
-
-    // Get unique subject prefixes
-    const subjectPrefixes = [
-      ...new Set(courses.map((c) => c.short_display_name.split(" ")[0])),
-    ];
-
-    const grouped = {};
-    for (const idx in subjectPrefixes) {
-      const prefix = subjectPrefixes[idx];
-
-      // Main courses: not Lab, not Tut
-      const main = courses.filter(
-        (c) =>
-          c.short_display_name.split(" ")[0] === prefix &&
-          !c.short_display_name.includes("Lab") &&
-          !c.short_display_name.includes("Tut"),
-      );
-
-      // Lab/Tut courses
-      const lab = courses.filter(
-        (c) =>
-          (c.short_display_name.includes("Lab") ||
-            c.short_display_name.includes("Tut")) &&
-          c.short_display_name.includes(prefix),
-      );
-
-      grouped[prefix] = { main, lab };
-    }
-
-    console.log(grouped);
-    fetchAttendanceData(grouped);
-  };
-
-  // Fetch all courses for a given course hash
-  const fetchAllCourses = async (courseHash) => {
-    const token = await getAccessToken();
-    try {
-      const { data } = await axios.get(
-        `https://my.newtonschool.co/api/v2/course/h/${courseHash}/learning_course/all/?pagination=false`,
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
-      groupCourses(data);
-    } catch (err) {
-      alert(err);
-    }
-  };
-
-  // Initialize: query the active tab and start fetching
-  const initialize = () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs.length === 0 || !tabs[0].url) {
-        alert("No active tab or tab URL is undefined.");
+    chrome.runtime.sendMessage({ action: "FETCH_ATTENDANCE" }, (response) => {
+      // Handle chrome runtime errors (e.g., extension context invalidated)
+      if (chrome.runtime.lastError) {
+        console.error("Runtime error:", chrome.runtime.lastError.message);
+        setError("FETCH_FAILED_NO_CACHE");
+        setIsLoading(false);
+        setIsRefreshing(false);
         return;
       }
 
-      const activeTab = tabs[0];
-
-      if (
-        !activeTab.url ||
-        !activeTab.url.startsWith("https://my.newtonschool.co/course/")
-      ) {
-        if (activeTab.url.startsWith("https://my.newtonschool.co/dashboard")) {
-          alert("Please Select a NST course first, then Open Extension");
-          return;
-        } else {
-          alert("Please Select a NST course first, then Open Extension");
-          window.open("https://my.newtonschool.co/dashboard");
-          return;
-        }
+      if (!response) {
+        setError("FETCH_FAILED_NO_CACHE");
+        setIsLoading(false);
+        setIsRefreshing(false);
+        return;
       }
 
-      // Extract course hash from URL
-      const courseHash = activeTab.url.split("/")[4];
+      if (response.error) {
+        setError(response.error);
+        setIsLoading(false);
+        setIsRefreshing(false);
+        return;
+      }
 
-      chrome.scripting
-        .executeScript({
-          target: { tabId: activeTab.id },
-          function: fetchAllCourses(courseHash),
-        })
-        .catch((err) => console.error("Execution error:", err));
+      if (response.success) {
+        setAttendanceData(response.data);
+        setLastFetched(response.lastFetched);
+        setIsStale(response.stale || false);
+        setStaleReason(response.staleReason || "");
+        setError(null);
+      }
+
+      setIsLoading(false);
+      setIsRefreshing(false);
     });
-  };
-
-  useEffect(() => {
-    initialize();
   }, []);
 
+  // ── On mount: fetch attendance ──
+  useEffect(() => {
+    fetchAttendance(false);
+  }, [fetchAttendance]);
+
+  // ── Format time ago ──
+  const getTimeAgo = (timestamp) => {
+    if (!timestamp) return "";
+    const diff = Date.now() - timestamp;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  };
+
+  // ── Error States ──
+  if (!isLoading && error) {
+    return (
+      <div
+        className="w-184 h-131 flex flex-col items-center justify-center px-8"
+        style={{ background: "var(--background)" }}
+      >
+        {error === "NOT_LOGGED_IN" && (
+          <div className="text-center space-y-4">
+            <div
+              className="mx-auto w-14 h-14 rounded-full flex items-center justify-center"
+              style={{ background: "rgba(255,255,255,0.06)" }}
+            >
+              <LogIn className="w-7 h-7" style={{ color: "#aaa" }} />
+            </div>
+            <h2
+              className="text-lg font-bold"
+              style={{ color: "var(--foreground)" }}
+            >
+              Not Logged In
+            </h2>
+            <p
+              className="text-sm max-w-xs"
+              style={{ color: "var(--muted-foreground)" }}
+            >
+              Please login to{" "}
+              <a
+                href="https://my.newtonschool.co"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline"
+                style={{ color: "#fff" }}
+              >
+                Newton School
+              </a>{" "}
+              in your browser first, then click the extension again.
+            </p>
+            <button
+              onClick={() => fetchAttendance(false)}
+              className="mt-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
+              style={{
+                background: "rgba(255,255,255,0.1)",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.15)",
+              }}
+              onMouseOver={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.18)")
+              }
+              onMouseOut={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.1)")
+              }
+            >
+              <span className="flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5" />
+                Retry
+              </span>
+            </button>
+          </div>
+        )}
+
+        {(error === "FETCH_FAILED_NO_CACHE" || error === "NO_NST_COURSE") && (
+          <div className="text-center space-y-4">
+            <div
+              className="mx-auto w-14 h-14 rounded-full flex items-center justify-center"
+              style={{ background: "rgba(255,255,255,0.06)" }}
+            >
+              <WifiOff className="w-7 h-7" style={{ color: "#aaa" }} />
+            </div>
+            <h2
+              className="text-lg font-bold"
+              style={{ color: "var(--foreground)" }}
+            >
+              Could Not Load Data
+            </h2>
+            <p
+              className="text-sm max-w-xs"
+              style={{ color: "var(--muted-foreground)" }}
+            >
+              {error === "NO_NST_COURSE"
+                ? "No Newton School of Technology course found in your account."
+                : "Failed to fetch attendance data. Please check your connection and try again."}
+            </p>
+            <button
+              onClick={() => fetchAttendance(false)}
+              className="mt-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
+              style={{
+                background: "rgba(255,255,255,0.1)",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.15)",
+              }}
+              onMouseOver={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.18)")
+              }
+              onMouseOut={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.1)")
+              }
+            >
+              <span className="flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5" />
+                Refresh
+              </span>
+            </button>
+          </div>
+        )}
+
+        {error === "NEED_SETUP" && (
+          <div className="text-center space-y-4">
+            <div
+              className="mx-auto w-14 h-14 rounded-full flex items-center justify-center"
+              style={{ background: "rgba(255,255,255,0.06)" }}
+            >
+              <BookOpen className="w-7 h-7" style={{ color: "#aaa" }} />
+            </div>
+            <h2
+              className="text-lg font-bold"
+              style={{ color: "var(--foreground)" }}
+            >
+              One-Time Setup Needed
+            </h2>
+            <p
+              className="text-sm max-w-xs"
+              style={{ color: "var(--muted-foreground)" }}
+            >
+              Open any course on{" "}
+              <a
+                href="https://my.newtonschool.co/dashboard"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline"
+                style={{ color: "#fff" }}
+              >
+                Newton School
+              </a>{" "}
+              and click this extension once. After that, it will work from{" "}
+              <strong style={{ color: "#fff" }}>any tab</strong> forever!
+            </p>
+            <button
+              onClick={() => fetchAttendance(false)}
+              className="mt-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
+              style={{
+                background: "rgba(255,255,255,0.1)",
+                color: "#fff",
+                border: "1px solid rgba(255,255,255,0.15)",
+              }}
+              onMouseOver={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.18)")
+              }
+              onMouseOut={(e) =>
+                (e.target.style.background = "rgba(255,255,255,0.1)")
+              }
+            >
+              <span className="flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5" />
+                I've opened a course, retry
+              </span>
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Main Render ──
   return (
-    <AttendanceDashboard
-      AttandanceData={attendanceData}
-      isLoading={isLoading}
-    />
+    <div className="relative">
+      {/* ── Stale Data Warning Banner ── */}
+      {isStale && !isLoading && (
+        <div
+          className="flex items-center justify-between px-4 py-2.5"
+          style={{
+            background: "rgba(245, 158, 11, 0.12)",
+            borderBottom: "1px solid rgba(245, 158, 11, 0.25)",
+          }}
+        >
+          <div className="flex items-center gap-2">
+            <AlertTriangle
+              className="w-3.5 h-3.5 shrink-0"
+              style={{ color: "#f59e0b" }}
+            />
+            <span
+              className="text-xs"
+              style={{ color: "rgba(255,255,255,0.8)" }}
+            >
+              {staleReason || "Showing cached data"} ·{" "}
+              <span style={{ color: "var(--muted-foreground)" }}>
+                Last updated {getTimeAgo(lastFetched)}
+              </span>
+            </span>
+          </div>
+          <button
+            onClick={() => fetchAttendance(true)}
+            disabled={isRefreshing}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all duration-200"
+            style={{
+              background: "rgba(255,255,255,0.1)",
+              color: "#fff",
+              border: "1px solid rgba(255,255,255,0.12)",
+            }}
+          >
+            <RefreshCw
+              className={`w-3 h-3 ${isRefreshing ? "animate-spin" : ""}`}
+            />
+            {isRefreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+      )}
+
+      {/* ── Last Fetched + Refresh (for fresh data too) ── */}
+      {!isStale && !isLoading && lastFetched && (
+        <div
+          className="flex items-center justify-between px-5 pt-1.5 pb-0"
+          style={{ background: "var(--background)" }}
+        >
+          <span
+            className="text-[10px]"
+            style={{ color: "var(--muted-foreground)" }}
+          >
+            Updated {getTimeAgo(lastFetched)}
+          </span>
+          <button
+            onClick={() => fetchAttendance(true)}
+            disabled={isRefreshing}
+            className="flex items-center gap-1 text-[10px] transition-all duration-200"
+            style={{ color: "var(--muted-foreground)" }}
+          >
+            <RefreshCw
+              className={`w-2.5 h-2.5 ${isRefreshing ? "animate-spin" : ""}`}
+            />
+            {isRefreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+      )}
+
+      <AttendanceDashboard
+        AttandanceData={attendanceData}
+        isLoading={isLoading}
+      />
+    </div>
   );
 }
 
